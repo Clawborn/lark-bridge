@@ -1,5 +1,5 @@
 import { Plugin, PluginSettingTab, Setting, Notice, App, requestUrl } from "obsidian";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import * as path from "path";
 import * as fs from "fs";
 
@@ -36,7 +36,7 @@ const FEISHU_BASE = "https://open.feishu.cn/open-apis";
 export default class LarkBridgePlugin extends Plugin {
   settings!: LarkBridgeSettings;
   syncing = false;
-  cliAvailable: boolean | null = null;
+  private _cliAvailable: boolean | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -49,6 +49,10 @@ export default class LarkBridgePlugin extends Plugin {
     });
   }
 
+  onunload() {
+    this.syncing = false;
+  }
+
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
@@ -58,37 +62,47 @@ export default class LarkBridgePlugin extends Plugin {
 
   // ─── Mode detection ──────────────────────────────────────────────
 
-  async hasCliMode(): Promise<boolean> {
-    if (this.cliAvailable !== null) return this.cliAvailable;
+  async checkCliStatus(): Promise<{ installed: boolean; loggedIn: boolean; userName: string }> {
     try {
-      await this.runShell("lark-cli --version", 5_000);
-      const out = await this.runShell("lark-cli auth status --format json", 5_000);
-      const d = JSON.parse(out.slice(out.indexOf("{")));
-      this.cliAvailable = d.tokenStatus === "valid";
+      await this.execLarkCli(["--version"], 5_000);
     } catch {
-      this.cliAvailable = false;
+      this._cliAvailable = false;
+      return { installed: false, loggedIn: false, userName: "" };
     }
-    return this.cliAvailable;
+    try {
+      const out = await this.execLarkCli(["auth", "status", "--format", "json"], 5_000);
+      const d = this.parseJson(out);
+      if (d?.tokenStatus === "valid") {
+        this._cliAvailable = true;
+        return { installed: true, loggedIn: true, userName: d.userName || "" };
+      }
+    } catch {}
+    this._cliAvailable = false;
+    return { installed: true, loggedIn: false, userName: "" };
   }
 
   hasApiMode(): boolean {
     return !!(this.settings.appId && this.settings.appSecret && this.settings.userAccessToken);
   }
 
-  async resolveMode(): Promise<"api" | "cli"> {
-    if (this.settings.mode === "api") return "api";
-    if (this.settings.mode === "cli") return "cli";
-    // auto: prefer API if configured, fallback to CLI
-    if (this.hasApiMode()) return "api";
-    if (await this.hasCliMode()) return "cli";
-    return "api"; // will fail with helpful message
+  resetCliCache() {
+    this._cliAvailable = null;
   }
 
-  // ─── Shell helpers (CLI mode) ────────────────────────────────────
+  private async resolveMode(): Promise<"api" | "cli"> {
+    if (this.settings.mode === "api") return "api";
+    if (this.settings.mode === "cli") return "cli";
+    if (this.hasApiMode()) return "api";
+    if (this._cliAvailable === null) await this.checkCliStatus();
+    if (this._cliAvailable) return "cli";
+    return "api";
+  }
 
-  runShell(cmd: string, timeout = 30_000): Promise<string> {
+  // ─── Shell helpers (CLI mode, safe) ──────────────────────────────
+
+  private execLarkCli(args: string[], timeout = 30_000): Promise<string> {
     return new Promise((resolve, reject) => {
-      exec(cmd, {
+      execFile("lark-cli", args, {
         timeout,
         maxBuffer: 10 * 1024 * 1024,
         env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin` },
@@ -99,52 +113,49 @@ export default class LarkBridgePlugin extends Plugin {
     });
   }
 
+  private execCurl(args: string[], timeout = 180_000): Promise<void> {
+    return new Promise((resolve, reject) => {
+      execFile("curl", args, { timeout }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+  }
+
   // ─── API helpers (API mode) ──────────────────────────────────────
 
-  async apiRequest(urlPath: string, options: { method?: string; body?: any; params?: Record<string, string>; binary?: boolean } = {}): Promise<any> {
+  private async apiRequest(urlPath: string, opts: { method?: string; body?: any; binary?: boolean } = {}): Promise<any> {
     await this.ensureToken();
-    const method = options.method || "GET";
-    let url = `${FEISHU_BASE}${urlPath}`;
-
-    if (options.params) {
-      const qs = new URLSearchParams(options.params).toString();
-      url += (url.includes("?") ? "&" : "?") + qs;
-    }
-
+    const method = opts.method || "GET";
+    const url = `${FEISHU_BASE}${urlPath}`;
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.settings.userAccessToken}`,
     };
-    if (options.body) headers["Content-Type"] = "application/json";
+    if (opts.body) headers["Content-Type"] = "application/json";
 
     const resp = await requestUrl({
       url,
       method,
       headers,
-      body: options.body ? JSON.stringify(options.body) : undefined,
+      body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
 
-    if (options.binary) return resp.arrayBuffer;
+    if (opts.binary) return resp.arrayBuffer;
     return resp.json;
   }
 
-  async ensureToken() {
+  private async ensureToken() {
     if (this.settings.userAccessToken && this.settings.tokenExpiry > Date.now() + 60_000) return;
     if (!this.settings.refreshToken || !this.settings.appId || !this.settings.appSecret) {
-      throw new Error("Not logged in. Go to LarkBridge settings and click 'Login with Feishu'.");
+      throw new Error("Not logged in. Go to Settings → LarkBridge and click 'Login'.");
     }
 
-    // Refresh the token
+    const appToken = await this.getAppAccessToken();
     const resp = await requestUrl({
       url: `${FEISHU_BASE}/authen/v1/oidc/refresh_access_token`,
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${await this.getAppAccessToken()}`,
-      },
-      body: JSON.stringify({
-        grant_type: "refresh_token",
-        refresh_token: this.settings.refreshToken,
-      }),
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${appToken}` },
+      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: this.settings.refreshToken }),
     });
 
     if (resp.json?.code === 0) {
@@ -161,7 +172,7 @@ export default class LarkBridgePlugin extends Plugin {
     }
   }
 
-  async getAppAccessToken(): Promise<string> {
+  private async getAppAccessToken(): Promise<string> {
     const resp = await requestUrl({
       url: `${FEISHU_BASE}/auth/v3/app_access_token/internal`,
       method: "POST",
@@ -176,20 +187,25 @@ export default class LarkBridgePlugin extends Plugin {
 
   async startLogin(): Promise<string> {
     if (!this.settings.appId || !this.settings.appSecret) {
-      throw new Error("Please fill in App ID and App Secret first.");
+      throw new Error("Fill in App ID and App Secret first.");
     }
 
     const appToken = await this.getAppAccessToken();
-
-    // Request device code
     const resp = await requestUrl({
       url: `${FEISHU_BASE}/authen/v1/device_authorization`,
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${appToken}` },
-      body: JSON.stringify({ scope: "search:docs:read docx:document:readonly docs:document.content:read docs:document.media:download docs:document:export drive:file:download vc:meeting.search:read vc:note:read minutes:minutes:readonly minutes:minutes.media:export" }),
+      body: JSON.stringify({
+        scope: [
+          "search:docs:read", "docx:document:readonly", "docs:document.content:read",
+          "docs:document.media:download", "docs:document:export", "drive:file:download",
+          "vc:meeting.search:read", "vc:note:read", "minutes:minutes:readonly",
+          "minutes:minutes.media:export",
+        ].join(" "),
+      }),
     });
 
-    if (resp.json?.code !== 0) throw new Error(`Device auth failed: ${resp.json?.msg || "unknown"}`);
+    if (resp.json?.code !== 0) throw new Error(`Auth failed: ${resp.json?.msg || "unknown"}`);
 
     const data = resp.json.data;
     const verificationUrl = data.verification_url || data.verification_uri;
@@ -197,20 +213,21 @@ export default class LarkBridgePlugin extends Plugin {
     const interval = (data.interval || 5) * 1000;
     const expiresIn = data.expires_in || 600;
 
-    // Open browser
     window.open(verificationUrl);
 
-    // Poll for token
     const deadline = Date.now() + expiresIn * 1000;
     while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, interval));
+      await sleep(interval);
 
       try {
         const tokenResp = await requestUrl({
           url: `${FEISHU_BASE}/authen/v1/device_token`,
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${appToken}` },
-          body: JSON.stringify({ device_code: deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code" }),
+          body: JSON.stringify({
+            device_code: deviceCode,
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          }),
         });
 
         if (tokenResp.json?.code === 0) {
@@ -220,7 +237,6 @@ export default class LarkBridgePlugin extends Plugin {
           this.settings.tokenExpiry = Date.now() + td.expires_in * 1000;
           await this.saveSettings();
 
-          // Get user name
           try {
             const me = await this.apiRequest("/authen/v1/user_info");
             return me.data?.name || "Feishu User";
@@ -228,13 +244,12 @@ export default class LarkBridgePlugin extends Plugin {
             return "Feishu User";
           }
         }
-        // authorization_pending → keep polling
-      } catch { /* keep polling */ }
+      } catch { /* authorization_pending, keep polling */ }
     }
     throw new Error("Login timed out. Please try again.");
   }
 
-  // ─── Shared utilities ────────────────────────────────────────────
+  // ─── Utilities ───────────────────────────────────────────────────
 
   private vaultPath(): string {
     return (this.app.vault.adapter as any).basePath;
@@ -251,21 +266,25 @@ export default class LarkBridgePlugin extends Plugin {
     return new Set(fs.readdirSync(p).filter((f) => f.endsWith(".md")));
   }
   private safe(name: string, max = 60): string {
-    let s = name.replace(/[/:*?"<>|]/g, "").trim();
+    let s = name.replace(/[/:*?"<>|\\\n\r]/g, "").trim();
     return s.length > max ? s.slice(0, max) : s;
   }
   private dateFrom(title: string): string | null {
     const m = title.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
     if (m) return `${m[1]}-${String(+m[2]).padStart(2, "0")}-${String(+m[3]).padStart(2, "0")}`;
+    // MM-DD without year: use current year
     const m2 = title.match(/^(\d{2})-(\d{2})/);
-    if (m2) return `2026-${m2[1]}-${m2[2]}`;
+    if (m2) return `${new Date().getFullYear()}-${m2[1]}-${m2[2]}`;
     return null;
   }
   private topicFrom(title: string): string {
-    let t = title.replace(/^(智能纪要[：:]|文字记录[：:])/, "").replace(/\s*\d{4}年\d{1,2}月\d{1,2}日\s*/, "").replace(/^\d{2}-\d{2}\s*[|｜]?\s*/, "");
+    let t = title
+      .replace(/^(智能纪要[：:]|文字记录[：:])/, "")
+      .replace(/\s*\d{4}年\d{1,2}月\d{1,2}日\s*/, "")
+      .replace(/^\d{2}-\d{2}\s*[|｜]?\s*/, "");
     return this.safe(t);
   }
-  private parseShellJson(raw: string): any {
+  private parseJson(raw: string): any {
     const i = raw.indexOf("{");
     if (i === -1) return null;
     try { return JSON.parse(raw.slice(i)); } catch { return null; }
@@ -273,7 +292,7 @@ export default class LarkBridgePlugin extends Plugin {
 
   // ─── Tag cleaning ────────────────────────────────────────────────
 
-  cleanTags(c: string): string {
+  private cleanTags(c: string): string {
     c = c.replace(/<add-ons[^>]*(?:\/?>[\s\S]*?<\/add-ons>|\/?>)/g, "");
     c = c.replace(/<reference-synced[^>]*>([\s\S]*?)<\/reference-synced>/g, "$1");
     c = c.replace(/<image\s+token="([^"]+)"[^/]*\/>/g, "[飞书图片: $1]");
@@ -304,10 +323,10 @@ export default class LarkBridgePlugin extends Plugin {
     for (let page = 0; page < 10; page++) {
       try {
         if (mode === "cli") {
-          let cmd = `lark-cli docs +search --query "${query}" --page-size 20 --format json`;
-          if (pageToken) cmd += ` --page-token '${pageToken}'`;
-          const out = await this.runShell(cmd, 30_000);
-          const d = this.parseShellJson(out);
+          const args = ["docs", "+search", "--query", query, "--page-size", "20", "--format", "json"];
+          if (pageToken) args.push("--page-token", pageToken);
+          const out = await this.execLarkCli(args, 30_000);
+          const d = this.parseJson(out);
           if (!d?.data) break;
           results.push(...(d.data.results || []));
           if (!d.data.has_more) break;
@@ -317,14 +336,12 @@ export default class LarkBridgePlugin extends Plugin {
           if (pageToken) body.page_token = pageToken;
           const resp = await this.apiRequest("/search/v2/doc_wiki/search", { method: "POST", body });
           if (!resp?.data) break;
-          // Transform API results to match CLI format
           for (const item of resp.data.items || []) {
             results.push({
               title_highlighted: item.doc?.title || "",
               result_meta: {
                 token: item.doc?.doc_token || "",
                 create_time_iso: item.doc?.create_time || "",
-                doc_types: item.doc?.doc_type || "DOCX",
               },
             });
           }
@@ -341,9 +358,9 @@ export default class LarkBridgePlugin extends Plugin {
 
   private async fetchDoc(token: string, mode: "api" | "cli"): Promise<string> {
     if (mode === "cli") {
-      return await this.runShell(`lark-cli docs +fetch --doc "${token}" --format pretty`, 30_000);
+      return await this.execLarkCli(["docs", "+fetch", "--doc", token, "--format", "pretty"], 30_000);
     }
-    // API mode: get raw content
+    // API mode: get blocks and convert to text
     const resp = await this.apiRequest(`/docx/v1/documents/${token}/raw_content`);
     return resp?.data?.content || "";
   }
@@ -359,7 +376,13 @@ export default class LarkBridgePlugin extends Plugin {
     if (mode === "cli") {
       try {
         const file = path.basename(outPath);
-        await this.runShell(`cd "${dir}" && lark-cli docs +media-download --token "${token}" --type ${type} --output "${file}" --overwrite`, 30_000);
+        // execFile with cwd instead of shell cd
+        await new Promise<void>((resolve, reject) => {
+          execFile("lark-cli", ["docs", "+media-download", "--token", token, "--type", type, "--output", file, "--overwrite"], {
+            timeout: 30_000, cwd: dir,
+            env: { ...process.env, PATH: `${process.env.PATH}:/usr/local/bin:/opt/homebrew/bin` },
+          }, (err) => err ? reject(err) : resolve());
+        });
         return fs.existsSync(outPath) && fs.statSync(outPath).size > 100;
       } catch { return false; }
     }
@@ -417,8 +440,12 @@ export default class LarkBridgePlugin extends Plugin {
           let duration = 0;
 
           if (mode === "cli") {
-            const out = await this.runShell(`lark-cli minutes minutes get --params '{"minute_token":"${token}"}' --format json`, 15_000);
-            const meta = this.parseShellJson(out);
+            const out = await this.execLarkCli([
+              "minutes", "minutes", "get",
+              "--params", JSON.stringify({ minute_token: token }),
+              "--format", "json",
+            ], 15_000);
+            const meta = this.parseJson(out);
             duration = parseInt(meta?.data?.minute?.duration || "0");
           } else {
             const resp = await this.apiRequest(`/minutes/v1/minutes/${token}`);
@@ -434,20 +461,23 @@ export default class LarkBridgePlugin extends Plugin {
           const recPath = path.join(sp, recName);
           if (fs.existsSync(recPath)) continue;
 
+          // Get download URL
+          let downloadUrl = "";
           if (mode === "cli") {
-            const urlOut = await this.runShell(`lark-cli minutes +download --minute-tokens "${token}" --url-only`, 15_000);
-            const urlData = this.parseShellJson(urlOut);
+            const urlOut = await this.execLarkCli([
+              "minutes", "+download", "--minute-tokens", token, "--url-only",
+            ], 15_000);
+            const urlData = this.parseJson(urlOut);
             if (!urlData?.ok) continue;
-            await this.runShell(`curl -sL -o "${recPath}" "${urlData.data.download_url}"`, 180_000);
+            downloadUrl = urlData.data.download_url;
           } else {
-            // API: get media download URL
             const resp = await this.apiRequest(`/minutes/v1/minutes/${token}/media`, { method: "POST", body: {} });
-            const url = resp?.data?.download_url;
-            if (url) {
-              const dlResp = await requestUrl({ url, method: "GET" });
-              if (dlResp.arrayBuffer) fs.writeFileSync(recPath, Buffer.from(dlResp.arrayBuffer));
-            }
+            downloadUrl = resp?.data?.download_url || "";
           }
+          if (!downloadUrl) continue;
+
+          // Download with curl (safe for large files, no OOM)
+          await this.execCurl(["-sL", "-o", recPath, downloadUrl]);
         } catch { /* skip */ }
       }
     }
@@ -466,12 +496,12 @@ export default class LarkBridgePlugin extends Plugin {
     try {
       const mode = await this.resolveMode();
 
-      if (mode === "cli" && !(await this.hasCliMode())) {
-        new Notice("LarkBridge: lark-cli not found or not logged in.");
+      if (mode === "cli" && !this._cliAvailable) {
+        new Notice("LarkBridge: lark-cli not available. Check settings.");
         return;
       }
       if (mode === "api" && !this.hasApiMode()) {
-        new Notice("LarkBridge: Please login first in Settings → LarkBridge.");
+        new Notice("LarkBridge: Not logged in. Go to Settings → LarkBridge.");
         return;
       }
 
@@ -529,6 +559,12 @@ export default class LarkBridgePlugin extends Plugin {
   }
 }
 
+// ─── Helpers ───────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // ─── Settings tab ──────────────────────────────────────────────────
 
 class LarkBridgeSettingTab extends PluginSettingTab {
@@ -543,147 +579,125 @@ class LarkBridgeSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // ─── Title ───────────────────────────────────────────────────
     containerEl.createEl("h2", { text: "LarkBridge" });
 
-    // ─── Status detection ────────────────────────────────────────
+    // ─── Status ──────────────────────────────────────────────────
     const statusEl = containerEl.createDiv();
     statusEl.style.cssText = "padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;line-height:1.6;";
 
-    const hasCli = await this.plugin.hasCliMode();
+    const cli = await this.plugin.checkCliStatus();
     const hasApi = this.plugin.hasApiMode();
 
     if (hasApi) {
       statusEl.style.background = "var(--background-modifier-success)";
       statusEl.style.color = "var(--text-on-accent)";
-      statusEl.setText("Connected via Feishu API. Click the sync icon (↻) in the sidebar to start.");
-    } else if (hasCli) {
+      statusEl.textContent = "Connected via Feishu API. Click the ↻ icon in the sidebar to sync.";
+    } else if (cli.loggedIn) {
       statusEl.style.background = "var(--background-modifier-success)";
       statusEl.style.color = "var(--text-on-accent)";
-      statusEl.setText("Connected via lark-cli. Click the sync icon (↻) in the sidebar to start.");
+      statusEl.textContent = `Connected via lark-cli (${cli.userName}). Click the ↻ icon in the sidebar to sync.`;
     } else {
       statusEl.style.background = "var(--background-modifier-error)";
       statusEl.style.color = "var(--text-on-accent)";
-      statusEl.setText("Not connected. Choose a setup method below.");
+      statusEl.textContent = "Not connected. Choose a setup method below.";
     }
 
-    // ─── Method 1: API (no terminal needed) ──────────────────────
-    const apiSection = containerEl.createEl("details", { attr: { open: !hasCli || hasApi ? "" : undefined } });
+    // ─── Method 1: API ───────────────────────────────────────────
+    const apiSection = containerEl.createEl("details");
+    if (!cli.loggedIn || hasApi) apiSection.setAttribute("open", "");
     apiSection.style.cssText = "margin-bottom:16px;border:1px solid var(--background-modifier-border);border-radius:8px;padding:12px;";
-    const apiSummary = apiSection.createEl("summary", { text: "Method 1: Feishu API (recommended, no terminal needed)" });
-    apiSummary.style.cssText = "cursor:pointer;font-weight:600;margin-bottom:8px;";
-    const apiContent = apiSection.createDiv();
+    apiSection.createEl("summary", {
+      text: "Method 1: Feishu API (recommended, no terminal needed)",
+      attr: { style: "cursor:pointer;font-weight:600;margin-bottom:8px;" },
+    });
+    const apiDiv = apiSection.createDiv();
 
-    // Step 1: Create app
-    apiContent.createEl("p", { text: "Step 1: Create a Feishu app" });
-    new Setting(apiContent)
-      .setName("Open Feishu Developer Console")
-      .setDesc("Create an app, then copy App ID and App Secret below")
-      .addButton((b) =>
-        b.setButtonText("Open").onClick(() => window.open("https://open.feishu.cn/app")),
-      );
+    // Step 1
+    new Setting(apiDiv)
+      .setName("Step 1: Create a Feishu app")
+      .setDesc("Go to Feishu Developer Console, create an app, copy App ID and App Secret.")
+      .addButton((b) => b.setButtonText("Open console").onClick(() => window.open("https://open.feishu.cn/app")));
 
-    // Step 2: Fill credentials
-    apiContent.createEl("p", { text: "Step 2: Fill in credentials" });
-    new Setting(apiContent)
+    // Step 2
+    new Setting(apiDiv)
       .setName("App ID")
-      .addText((t) =>
-        t.setPlaceholder("cli_xxxxxxxx")
-          .setValue(this.plugin.settings.appId)
-          .onChange(async (v) => { this.plugin.settings.appId = v.trim(); await this.plugin.saveSettings(); }),
-      );
+      .addText((t) => t.setPlaceholder("cli_xxxxxxxx").setValue(this.plugin.settings.appId)
+        .onChange(async (v) => { this.plugin.settings.appId = v.trim(); await this.plugin.saveSettings(); }));
 
-    new Setting(apiContent)
+    new Setting(apiDiv)
       .setName("App Secret")
       .addText((t) => {
-        t.setPlaceholder("xxxxxxxx")
-          .setValue(this.plugin.settings.appSecret)
+        t.setPlaceholder("xxxxxxxx").setValue(this.plugin.settings.appSecret)
           .onChange(async (v) => { this.plugin.settings.appSecret = v.trim(); await this.plugin.saveSettings(); });
         t.inputEl.type = "password";
       });
 
-    // Step 3: Login
-    apiContent.createEl("p", { text: "Step 3: Login" });
-    new Setting(apiContent)
-      .setName("Login with Feishu")
-      .setDesc("Opens browser for authorization. Come back after approving.")
-      .addButton((b) =>
-        b.setButtonText("Login").setCta().onClick(async () => {
-          b.setButtonText("Waiting...");
-          b.setDisabled(true);
-          try {
-            const name = await this.plugin.startLogin();
-            new Notice(`LarkBridge: Logged in as ${name}`);
-            this.display(); // refresh
-          } catch (e: any) {
-            new Notice(`LarkBridge: ${e.message}`);
-            b.setButtonText("Login");
-            b.setDisabled(false);
-          }
-        }),
-      );
+    // Step 3
+    new Setting(apiDiv)
+      .setName("Step 2: Login with Feishu")
+      .setDesc("Opens browser for authorization.")
+      .addButton((b) => b.setButtonText("Login").setCta().onClick(async () => {
+        b.setButtonText("Waiting...");
+        b.setDisabled(true);
+        try {
+          const name = await this.plugin.startLogin();
+          new Notice(`LarkBridge: Logged in as ${name}`);
+          this.display();
+        } catch (e: any) {
+          new Notice(`LarkBridge: ${e.message}`);
+          b.setButtonText("Login");
+          b.setDisabled(false);
+        }
+      }));
 
     if (hasApi) {
-      new Setting(apiContent)
+      new Setting(apiDiv)
         .setName("Logout")
-        .addButton((b) =>
-          b.setButtonText("Logout").setWarning().onClick(async () => {
-            this.plugin.settings.userAccessToken = "";
-            this.plugin.settings.refreshToken = "";
-            this.plugin.settings.tokenExpiry = 0;
-            await this.plugin.saveSettings();
-            this.display();
-          }),
-        );
+        .addButton((b) => b.setButtonText("Logout").setWarning().onClick(async () => {
+          this.plugin.settings.userAccessToken = "";
+          this.plugin.settings.refreshToken = "";
+          this.plugin.settings.tokenExpiry = 0;
+          await this.plugin.saveSettings();
+          this.display();
+        }));
     }
 
     // ─── Method 2: CLI ───────────────────────────────────────────
-    const cliSection = containerEl.createEl("details", { attr: { open: hasCli && !hasApi ? "" : undefined } });
+    const cliSection = containerEl.createEl("details");
+    if (cli.loggedIn && !hasApi) cliSection.setAttribute("open", "");
     cliSection.style.cssText = "margin-bottom:16px;border:1px solid var(--background-modifier-border);border-radius:8px;padding:12px;";
-    const cliSummary = cliSection.createEl("summary", { text: "Method 2: lark-cli (for terminal users)" });
-    cliSummary.style.cssText = "cursor:pointer;font-weight:600;margin-bottom:8px;";
-    const cliContent = cliSection.createDiv();
-    cliContent.innerHTML = `
-      <ol style="padding-left:20px;line-height:1.8;">
-        <li>Install: <code>npm install -g @larksuite/cli</code></li>
-        <li>Create app: <code>lark-cli config init</code></li>
-        <li>Login: <code>lark-cli auth login --recommend</code></li>
-        <li>Come back here and click Refresh</li>
-      </ol>
-    `;
+    cliSection.createEl("summary", {
+      text: "Method 2: lark-cli (for terminal users)",
+      attr: { style: "cursor:pointer;font-weight:600;margin-bottom:8px;" },
+    });
 
-    // ─── General settings ────────────────────────────────────────
+    const cliDiv = cliSection.createDiv();
+    const ol = cliDiv.createEl("ol", { attr: { style: "padding-left:20px;line-height:1.8;" } });
+    ol.createEl("li").createEl("code", { text: "npm install -g @larksuite/cli" });
+    ol.createEl("li").createEl("code", { text: "lark-cli config init" });
+    ol.createEl("li").createEl("code", { text: "lark-cli auth login --recommend" });
+    ol.createEl("li", { text: "Come back here and click Refresh" });
+
+    // ─── Sync settings ───────────────────────────────────────────
     containerEl.createEl("h3", { text: "Sync settings" });
 
     new Setting(containerEl)
       .setName("Sync directory")
       .setDesc("Folder for synced files (relative to vault root)")
-      .addText((t) =>
-        t.setValue(this.plugin.settings.syncDir).onChange(async (v) => {
-          this.plugin.settings.syncDir = v.trim();
-          await this.plugin.saveSettings();
-        }),
-      );
+      .addText((t) => t.setValue(this.plugin.settings.syncDir)
+        .onChange(async (v) => { this.plugin.settings.syncDir = v.trim(); await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName("Assets subdirectory")
       .setDesc("Subfolder for images and whiteboards")
-      .addText((t) =>
-        t.setValue(this.plugin.settings.assetsSubdir).onChange(async (v) => {
-          this.plugin.settings.assetsSubdir = v.trim();
-          await this.plugin.saveSettings();
-        }),
-      );
+      .addText((t) => t.setValue(this.plugin.settings.assetsSubdir)
+        .onChange(async (v) => { this.plugin.settings.assetsSubdir = v.trim(); await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName("Skip recordings under (minutes)")
       .setDesc("Don't download short recordings")
-      .addText((t) =>
-        t.setValue(String(this.plugin.settings.skipUnder)).onChange(async (v) => {
-          this.plugin.settings.skipUnder = parseInt(v) || 5;
-          await this.plugin.saveSettings();
-        }),
-      );
+      .addText((t) => t.setValue(String(this.plugin.settings.skipUnder))
+        .onChange(async (v) => { this.plugin.settings.skipUnder = parseInt(v) || 5; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName("Sync now")
@@ -691,6 +705,9 @@ class LarkBridgeSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Refresh status")
-      .addButton((b) => b.setButtonText("Refresh").onClick(() => { this.plugin.cliAvailable = null; this.display(); }));
+      .addButton((b) => b.setButtonText("Refresh").onClick(() => {
+        this.plugin.resetCliCache();
+        this.display();
+      }));
   }
 }
