@@ -150,19 +150,22 @@ export default class LarkBridgePlugin extends Plugin {
       throw new Error("Not logged in. Go to Settings → LarkBridge and click 'Login'.");
     }
 
-    const appToken = await this.getAppAccessToken();
     const resp = await requestUrl({
-      url: `${FEISHU_BASE}/authen/v1/oidc/refresh_access_token`,
+      url: "https://accounts.feishu.cn/oauth/v1/token",
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${appToken}` },
-      body: JSON.stringify({ grant_type: "refresh_token", refresh_token: this.settings.refreshToken }),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: this.settings.appId,
+        client_secret: this.settings.appSecret,
+        grant_type: "refresh_token",
+        refresh_token: this.settings.refreshToken,
+      }),
     });
 
-    if (resp.json?.code === 0) {
-      const d = resp.json.data;
-      this.settings.userAccessToken = d.access_token;
-      this.settings.refreshToken = d.refresh_token;
-      this.settings.tokenExpiry = Date.now() + d.expires_in * 1000;
+    if (resp.json?.access_token) {
+      this.settings.userAccessToken = resp.json.access_token;
+      this.settings.refreshToken = resp.json.refresh_token || this.settings.refreshToken;
+      this.settings.tokenExpiry = Date.now() + (resp.json.expires_in || 7200) * 1000;
       await this.saveSettings();
     } else {
       this.settings.userAccessToken = "";
@@ -190,51 +193,60 @@ export default class LarkBridgePlugin extends Plugin {
       throw new Error("Fill in App ID and App Secret first.");
     }
 
-    const appToken = await this.getAppAccessToken();
+    const ACCOUNTS_BASE = "https://accounts.feishu.cn";
+    const scopes = [
+      "search:docs:read", "docx:document:readonly", "docs:document.content:read",
+      "docs:document.media:download", "docs:document:export", "drive:file:download",
+      "vc:meeting.search:read", "vc:note:read", "minutes:minutes:readonly",
+      "minutes:minutes.media:export", "offline_access",
+    ].join(" ");
+
+    // Step 1: Request device code from accounts.feishu.cn
     const resp = await requestUrl({
-      url: `${FEISHU_BASE}/authen/v1/device_authorization`,
+      url: `${ACCOUNTS_BASE}/oauth/v1/device_authorization`,
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${appToken}` },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        scope: [
-          "search:docs:read", "docx:document:readonly", "docs:document.content:read",
-          "docs:document.media:download", "docs:document:export", "drive:file:download",
-          "vc:meeting.search:read", "vc:note:read", "minutes:minutes:readonly",
-          "minutes:minutes.media:export",
-        ].join(" "),
+        client_id: this.settings.appId,
+        client_secret: this.settings.appSecret,
+        scope: scopes,
       }),
     });
 
-    if (resp.json?.code !== 0) throw new Error(`Auth failed: ${resp.json?.msg || "unknown"}`);
+    if (resp.json?.error) throw new Error(`Auth failed: ${resp.json.error_description || resp.json.error}`);
 
-    const data = resp.json.data;
-    const verificationUrl = data.verification_url || data.verification_uri;
-    const deviceCode = data.device_code;
-    const interval = (data.interval || 5) * 1000;
-    const expiresIn = data.expires_in || 600;
+    const deviceCode = resp.json.device_code;
+    const verificationUrl = resp.json.verification_url || resp.json.verification_uri || resp.json.verification_uri_complete;
+    const interval = (resp.json.interval || 5) * 1000;
+    const expiresIn = resp.json.expires_in || 600;
 
+    if (!deviceCode || !verificationUrl) throw new Error("Invalid device auth response.");
+
+    // Step 2: Open browser for user to authorize
     window.open(verificationUrl);
 
+    // Step 3: Poll for token
     const deadline = Date.now() + expiresIn * 1000;
     while (Date.now() < deadline) {
       await sleep(interval);
 
       try {
         const tokenResp = await requestUrl({
-          url: `${FEISHU_BASE}/authen/v1/device_token`,
+          url: `${ACCOUNTS_BASE}/oauth/v1/device_token`,
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${appToken}` },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
+            client_id: this.settings.appId,
+            client_secret: this.settings.appSecret,
             device_code: deviceCode,
             grant_type: "urn:ietf:params:oauth:grant-type:device_code",
           }),
         });
 
-        if (tokenResp.json?.code === 0) {
-          const td = tokenResp.json.data;
-          this.settings.userAccessToken = td.access_token;
-          this.settings.refreshToken = td.refresh_token;
-          this.settings.tokenExpiry = Date.now() + td.expires_in * 1000;
+        if (tokenResp.json?.access_token) {
+          this.settings.userAccessToken = tokenResp.json.access_token;
+          this.settings.refreshToken = tokenResp.json.refresh_token || "";
+          this.settings.tokenExpiry = Date.now() + (tokenResp.json.expires_in || 7200) * 1000;
           await this.saveSettings();
 
           try {
@@ -244,7 +256,8 @@ export default class LarkBridgePlugin extends Plugin {
             return "Feishu User";
           }
         }
-      } catch { /* authorization_pending, keep polling */ }
+        // authorization_pending or slow_down → keep polling
+      } catch { /* keep polling */ }
     }
     throw new Error("Login timed out. Please try again.");
   }
