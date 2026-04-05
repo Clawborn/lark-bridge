@@ -15,7 +15,7 @@
     "sync",
     "meeting-notes"
   ],
-  "author": "Rain (clawyouseeme)",
+  "author": "Clawborn & clawyouseeme",
   "license": "MIT",
   "devDependencies": {
     "esbuild": "^0.21.0",

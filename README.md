@@ -102,4 +102,4 @@ MIT
 
 ## Author
 
-**Rain** ([@clawyouseeme](https://github.com/clawyouseeme))
+[@Clawborn](https://github.com/Clawborn) & [@clawyouseeme](https://github.com/clawyouseeme)
