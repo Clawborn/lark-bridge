@@ -28,7 +28,7 @@ export default class LarkBridgePlugin extends Plugin {
     this.addSettingTab(new LarkBridgeSettingTab(this.app, this));
 
     // Ribbon icon
-    this.addRibbonIcon("bridge", "LarkBridge: 同步飞书妙记", () => this.sync());
+    this.addRibbonIcon("refresh-cw", "LarkBridge: 同步飞书妙记", () => this.sync());
 
     // Command palette
     this.addCommand({
@@ -48,7 +48,7 @@ export default class LarkBridgePlugin extends Plugin {
 
   // ─── Helpers ─────────────────────────────────────────────────────
 
-  private run(cmd: string, timeout = 30_000): Promise<string> {
+  run(cmd: string, timeout = 30_000): Promise<string> {
     return new Promise((resolve, reject) => {
       exec(
         cmd,
@@ -353,15 +353,81 @@ class LarkBridgeSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
-  display() {
+  async display() {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl("h2", { text: "LarkBridge Settings" });
-    containerEl.createEl("p", {
-      text: "Prerequisites: lark-cli installed and logged in (npm install -g @larksuite/cli && lark-cli config init && lark-cli auth login --recommend)",
-    });
+    // ─── Status check ────────────────────────────────────────────
+    containerEl.createEl("h2", { text: "LarkBridge" });
 
+    const statusEl = containerEl.createDiv({ cls: "lark-bridge-status" });
+    statusEl.style.cssText = "padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:14px;";
+
+    // Check lark-cli
+    let cliInstalled = false;
+    let cliLoggedIn = false;
+    let userName = "";
+
+    try {
+      await this.plugin.run("lark-cli --version", 5_000);
+      cliInstalled = true;
+    } catch {}
+
+    if (cliInstalled) {
+      try {
+        const out = await this.plugin.run("lark-cli auth status --format json", 5_000);
+        const d = JSON.parse(out.slice(out.indexOf("{")));
+        if (d.tokenStatus === "valid") {
+          cliLoggedIn = true;
+          userName = d.userName || "";
+        }
+      } catch {}
+    }
+
+    if (!cliInstalled) {
+      statusEl.style.background = "var(--background-modifier-error)";
+      statusEl.style.color = "var(--text-on-accent)";
+      statusEl.innerHTML = `
+        <strong>Step 1: Install lark-cli</strong><br>
+        Open terminal and run:<br>
+        <code style="background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:3px;">npm install -g @larksuite/cli</code>
+      `;
+    } else if (!cliLoggedIn) {
+      statusEl.style.background = "var(--background-modifier-error)";
+      statusEl.style.color = "var(--text-on-accent)";
+      statusEl.innerHTML = `
+        <strong>Step 2: Login to Feishu</strong><br>
+        Open terminal and run:<br>
+        <code style="background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:3px;">lark-cli config init</code><br>
+        <code style="background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:3px;">lark-cli auth login --recommend</code>
+      `;
+    } else {
+      statusEl.style.background = "var(--background-modifier-success)";
+      statusEl.style.color = "var(--text-on-accent)";
+      statusEl.innerHTML = `<strong>Connected</strong> — logged in as ${userName || "Feishu user"}. Click the sync icon in the sidebar to start.`;
+    }
+
+    // ─── Setup guide (collapsed) ─────────────────────────────────
+    const guideDetails = containerEl.createEl("details");
+    guideDetails.style.cssText = "margin-bottom:16px;";
+    const guideSummary = guideDetails.createEl("summary", { text: "Setup guide (first-time users)" });
+    guideSummary.style.cssText = "cursor:pointer;font-weight:600;margin-bottom:8px;";
+    const guideContent = guideDetails.createDiv();
+    guideContent.innerHTML = `
+      <ol style="padding-left:20px;line-height:1.8;">
+        <li>Install <a href="https://nodejs.org">Node.js</a> (if not already installed)</li>
+        <li>Open Terminal and run: <code>npm install -g @larksuite/cli</code></li>
+        <li>Create a Feishu app: <code>lark-cli config init</code></li>
+        <li>Login: <code>lark-cli auth login --recommend</code></li>
+        <li>Come back here — the status above should turn green</li>
+        <li>Click the <strong>sync icon</strong> (↻) in the left sidebar</li>
+      </ol>
+      <p style="color:var(--text-muted);font-size:12px;">
+        For detailed instructions, visit <a href="https://github.com/Clawborn/lark-bridge">github.com/Clawborn/lark-bridge</a>
+      </p>
+    `;
+
+    // ─── Settings ────────────────────────────────────────────────
     new Setting(containerEl)
       .setName("Sync directory")
       .setDesc("Folder to save synced files (relative to vault root)")
@@ -396,7 +462,15 @@ class LarkBridgeSettingTab extends PluginSettingTab {
       .setName("Sync now")
       .setDesc("Manually trigger a sync")
       .addButton((b) =>
-        b.setButtonText("开始同步").onClick(() => this.plugin.sync()),
+        b.setButtonText("Start sync").onClick(() => this.plugin.sync()),
+      );
+
+    // ─── Refresh status button ───────────────────────────────────
+    new Setting(containerEl)
+      .setName("Refresh status")
+      .setDesc("Re-check lark-cli connection after setup")
+      .addButton((b) =>
+        b.setButtonText("Refresh").onClick(() => this.display()),
       );
   }
 }
