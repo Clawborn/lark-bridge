@@ -202,18 +202,25 @@ export default class LarkBridgePlugin extends Plugin {
     ].join(" ");
 
     // Step 1: Request device code from accounts.feishu.cn
-    const resp = await requestUrl({
-      url: `${ACCOUNTS_BASE}/oauth/v1/device_authorization`,
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: this.settings.appId,
-        client_secret: this.settings.appSecret,
-        scope: scopes,
-      }),
-    });
+    let resp: any;
+    try {
+      resp = await requestUrl({
+        url: `${ACCOUNTS_BASE}/oauth/v1/device_authorization`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          client_id: this.settings.appId,
+          client_secret: this.settings.appSecret,
+          scope: scopes,
+        }),
+        throw: false,
+      });
+    } catch (e: any) {
+      throw new Error(`Network error: ${e.message}`);
+    }
 
-    if (resp.json?.error) throw new Error(`Auth failed: ${resp.json.error_description || resp.json.error}`);
+    if (!resp.json) throw new Error(`Unexpected response (status ${resp.status})`);
+    if (resp.json.error) throw new Error(`Auth failed: ${resp.json.error_description || resp.json.error}`);
 
     const deviceCode = resp.json.device_code;
     const verificationUrl = resp.json.verification_url || resp.json.verification_uri || resp.json.verification_uri_complete;
@@ -241,6 +248,7 @@ export default class LarkBridgePlugin extends Plugin {
             device_code: deviceCode,
             grant_type: "urn:ietf:params:oauth:grant-type:device_code",
           }),
+          throw: false,
         });
 
         if (tokenResp.json?.access_token) {
