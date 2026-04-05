@@ -151,7 +151,7 @@ export default class LarkBridgePlugin extends Plugin {
     }
 
     const resp = await requestUrl({
-      url: "https://accounts.feishu.cn/oauth/v1/token",
+      url: `${FEISHU_BASE}/authen/v2/oauth/token`,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -239,7 +239,7 @@ export default class LarkBridgePlugin extends Plugin {
 
       try {
         const tokenResp = await requestUrl({
-          url: `${ACCOUNTS_BASE}/oauth/v1/device_token`,
+          url: `${FEISHU_BASE}/authen/v2/oauth/token`,
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -251,7 +251,7 @@ export default class LarkBridgePlugin extends Plugin {
           throw: false,
         });
 
-        if (tokenResp.json?.access_token) {
+        if (tokenResp.json?.access_token || tokenResp.json?.code === 0) {
           this.settings.userAccessToken = tokenResp.json.access_token;
           this.settings.refreshToken = tokenResp.json.refresh_token || "";
           this.settings.tokenExpiry = Date.now() + (tokenResp.json.expires_in || 7200) * 1000;
