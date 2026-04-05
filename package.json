@@ -1,0 +1,25 @@
+{
+  "name": "lark-bridge",
+  "version": "1.0.0",
+  "description": "Sync Feishu/Lark Minutes (meeting notes, transcripts, and recordings) to Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": [
+    "obsidian",
+    "feishu",
+    "lark",
+    "minutes",
+    "sync",
+    "meeting-notes"
+  ],
+  "author": "Rain (clawyouseeme)",
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.5.0",
+    "@types/node": "^20.0.0"
+  }
+}
