@@ -232,29 +232,31 @@ export default class LarkBridgePlugin extends Plugin {
     // Step 2: Open browser for user to authorize
     window.open(verificationUrl);
 
-    // Step 3: Poll for token
+    // Step 3: Poll for token using native fetch (requestUrl throws on 400)
+    const tokenUrl = `${FEISHU_BASE}/authen/v2/oauth/token`;
+    const tokenBody = JSON.stringify({
+      client_id: this.settings.appId,
+      client_secret: this.settings.appSecret,
+      device_code: deviceCode,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+    });
+
     const deadline = Date.now() + expiresIn * 1000;
     while (Date.now() < deadline) {
       await sleep(interval);
 
       try {
-        const tokenResp = await requestUrl({
-          url: `${FEISHU_BASE}/authen/v2/oauth/token`,
+        const raw = await fetch(tokenUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            client_id: this.settings.appId,
-            client_secret: this.settings.appSecret,
-            device_code: deviceCode,
-            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-          }),
-          throw: false,
+          body: tokenBody,
         });
+        const data = await raw.json();
 
-        if (tokenResp.json?.access_token || tokenResp.json?.code === 0) {
-          this.settings.userAccessToken = tokenResp.json.access_token;
-          this.settings.refreshToken = tokenResp.json.refresh_token || "";
-          this.settings.tokenExpiry = Date.now() + (tokenResp.json.expires_in || 7200) * 1000;
+        if (data.access_token) {
+          this.settings.userAccessToken = data.access_token;
+          this.settings.refreshToken = data.refresh_token || "";
+          this.settings.tokenExpiry = Date.now() + (data.expires_in || 7200) * 1000;
           await this.saveSettings();
 
           try {
@@ -264,8 +266,8 @@ export default class LarkBridgePlugin extends Plugin {
             return "Feishu User";
           }
         }
-        // authorization_pending or slow_down → keep polling
-      } catch { /* keep polling */ }
+        // authorization_pending / slow_down → keep polling
+      } catch { /* network error, keep polling */ }
     }
     throw new Error("Login timed out. Please try again.");
   }
