@@ -3,7 +3,7 @@
   "name": "LarkBridge",
   "version": "1.0.0",
   "minAppVersion": "1.0.0",
-  "description": "Sync Feishu/Lark Minutes — meeting notes, transcripts, and recordings — to your Obsidian vault with one click.",
+  "description": "Sync Feishu/Lark Minutes — meeting notes, transcripts, and recordings — with one click.",
   "author": "Clawborn & clawyouseeme",
   "authorUrl": "https://github.com/Clawborn",
   "isDesktopOnly": true
